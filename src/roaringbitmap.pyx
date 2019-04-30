@@ -56,7 +56,8 @@ from libc.string cimport memset, memcpy, memcmp, memmove
 from cpython.buffer cimport PyBUF_SIMPLE, Py_buffer, PyObject_CheckBuffer, \
 		PyObject_GetBuffer, PyBuffer_Release
 from cpython cimport array
-cimport cython
+
+import numpy as np
 
 cdef extern from *:
 	cdef bint PY2
@@ -213,14 +214,15 @@ cdef class RoaringBitmap(object):
 				ImmutableRoaringBitmap)
 		result.__setstate__(self.__getstate__())
 		return result
-
-	def __contains__(self, uint32_t elem):
+	cdef inline  bint __contains__nogil(self, uint32_t elem) nogil :
 		cdef int i = self._getindex(highbits(elem))
 		cdef Block b1
 		if i >= 0:
 			return block_contains(
 					self._getblk(i, &b1), lowbits(elem))
 		return False
+	def __contains__(self, uint32_t elem):
+		return self.__contains__nogil(elem)
 
 	def __richcmp__(x, y, int op):
 		return richcmp(x, y, op)
@@ -760,8 +762,7 @@ cdef class RoaringBitmap(object):
 		cdef RoaringBitmap ob2 = ensurerb(other)
 		return rb_jaccard_dist(ob1, ob2)
 
-	def rank(self, uint32_t x):
-		"""Return the number of elements ``<= x`` that are in this set."""
+	cdef inline size_t _rank(self, uint32_t x)  nogil:
 		cdef Block b1
 		cdef size_t size = 0, n
 		cdef uint16_t xhigh = highbits(x)
@@ -775,6 +776,10 @@ cdef class RoaringBitmap(object):
 						self._getblk(n, &b1),
 						lowbits(x))
 		return size
+
+	def rank(self, uint32_t x):
+		"""Return the number of elements ``<= x`` that are in this set."""
+		return self._rank(x)
 
 	def select(self, int i):
 		"""Return the ith element that is in this set.
@@ -804,6 +809,33 @@ cdef class RoaringBitmap(object):
 		if x in self:
 			return self.rank(x) - 1
 		raise IndexError
+
+	cdef inline void _index_many(self, uint32_t[:] xs, long [:] out) nogil:
+		"""
+		index_many implementation
+		:param xs: element to find indices
+		:return: the indices of element or -1
+		:return: 
+		"""
+		cdef uint32_t x, i
+		for i in range(xs.shape[0]):
+			x = xs[i]
+			if self.__contains__nogil(x):
+				out[i] = self._rank(x) - 1
+			else:
+				out[i] = -1l
+
+	def index_many(self, xs):
+		# type: (np.ndarray) -> np.ndarray
+		"""
+		Return indices of each element in xs. If an element does not exists, return -1
+		:param xs: element to find indices
+		:return: the indices of element or -1
+		"""
+		assert (isinstance(xs, np.ndarray) and xs.dtype == np.uint32), "for optimization, the xs needs to be an uint32 array"
+		output = np.zeros_like(xs, dtype=np.int64)
+		self._index_many(xs, output)
+		return output
 
 	def _ridx(self, i):
 		if i < 0:
@@ -1061,7 +1093,7 @@ cdef class RoaringBitmap(object):
 		memcpy(self.data[i].buf.ptr, block.buf.ptr, size * sizeof(uint16_t))
 		self.size += 1
 
-	cdef int _getindex(self, uint16_t key):
+	cdef int _getindex(self, uint16_t key) nogil:
 		if self.size == 0:
 			return -1
 		# Common case of appending in last block:
@@ -1069,7 +1101,7 @@ cdef class RoaringBitmap(object):
 			return self.size - 1
 		return self._binarysearch(0, self.size, key)
 
-	cdef int _binarysearch(self, int begin, int end, uint16_t key):
+	cdef int _binarysearch(self, int begin, int end, uint16_t key) nogil:
 		"""Binary search for key.
 
 		:returns: positive index ``i`` if ``key`` is found;
